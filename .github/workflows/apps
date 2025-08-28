@@ -1,0 +1,201 @@
+mkdir -p src
+
+# src/config.yaml
+cat > src/config.yaml << 'EOF'
+firm_name: "Your VC"
+time_window_days: 14
+sheet: { worksheet_name: "Leads" }
+countries: [Costa Rica, Guatemala, El Salvador, Honduras, Nicaragua, Panama, Belize, Colombia, Venezuela, Ecuador, Peru, Bolivia, Chile, Argentina, Uruguay, Paraguay, Brazil]
+country_aliases:
+  Costa Rica: ["Costa Rica","CR"]
+  El Salvador: ["El Salvador","SV"]
+  Honduras: ["Honduras","HN"]
+  Nicaragua: ["Nicaragua","NI"]
+  Guatemala: ["Guatemala","GT"]
+  Panama: ["Panamá","Panama","PA"]
+  Belize: ["Belize"]
+  Colombia: ["Colombia","CO"]
+  Venezuela: ["Venezuela","VE"]
+  Ecuador: ["Ecuador","EC"]
+  Peru: ["Perú","Peru","PE"]
+  Bolivia: ["Bolivia","BO"]
+  Chile: ["Chile","CL"]
+  Argentina: ["Argentina","AR"]
+  Uruguay: ["Uruguay","UY"]
+  Paraguay: ["Paraguay","PY"]
+  Brazil: ["Brasil","Brazil","BR"]
+sector_blacklist_terms: [fintech, payments, lending, "buy now pay later", wallet, neobank, "crypto exchange", remittance]
+post_revenue_terms: [post-revenue, revenue, facturación, ingresos, ARR, MRR, "paying customers", "clientes de pago", contratos, invoices, "compras recurrentes"]
+enterprise_signal_terms: [enterprise, B2B, contract, pilot, "paid pilot", "cliente corporativo", empresa]
+female_names_seed: [ana, maría, maria, camila, daniela, gabriela, valentina, isabella, sofia, sofía, fernanda, luisa, laura, andrea, carla, carolina, paula, juliana, claudia, patricia, mariana]
+scoring: { geo: 3, post_revenue: 3, female: 2, enterprise: 1, fintech_penalty: -2 }
+max_items_per_feed: 60
+EOF
+
+# src/sheets_io.py
+cat > src/sheets_io.py << 'EOF'
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from gspread_dataframe import set_with_dataframe
+
+SCOPE = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+
+def authorize_from_json(json_path: str):
+    creds = ServiceAccountCredentials.from_json_keyfile_name(json_path, SCOPE)
+    return gspread.authorize(creds)
+
+def open_or_create_sheet(gc, sheet_id: str):
+    return gc.open_by_key(sheet_id)
+
+def open_or_create_worksheet(sh, worksheet_name: str):
+    try:
+        return sh.worksheet(worksheet_name)
+    except Exception:
+        return sh.add_worksheet(title=worksheet_name, rows=1000, cols=20)
+
+def read_existing_urls(ws):
+    try:
+        return set([r.get("URL","") for r in ws.get_all_records() if r.get("URL")])
+    except Exception:
+        return set()
+
+def append_dataframe(ws, df):
+    all_vals = ws.get_all_values()
+    if len(all_vals) == 0:
+        set_with_dataframe(ws, df)
+    else:
+        set_with_dataframe(ws, df, row=len(all_vals)+1, include_column_header=False)
+EOF
+
+# src/sourcing.py
+cat > src/sourcing.py << 'EOF'
+import os, re, textwrap
+from datetime import datetime, timedelta
+from dateutil import tz
+import pandas as pd, feedparser, yaml
+from sheets_io import authorize_from_json, open_or_create_sheet, open_or_create_worksheet, read_existing_urls, append_dataframe
+
+TZ = os.getenv("TZ","America/Costa_Rica")
+LOCAL_TZ = tz.gettz(TZ)
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+
+with open(os.path.join(os.path.dirname(__file__),"config.yaml"),encoding="utf-8") as f:
+    C = yaml.safe_load(f)
+
+WNAME = C["sheet"]["worksheet_name"]
+DAYS  = C["time_window_days"]
+MAXN  = C["max_items_per_feed"]
+COUNTRIES, ALIASES = C["countries"], C["country_aliases"]
+POST, ENT = C["post_revenue_terms"], C["enterprise_signal_terms"]
+FEMALE = set(C["female_names_seed"])
+BLACK  = C["sector_blacklist_terms"]
+SCORE  = C["scoring"]
+MEDIA  = ["https://contxto.com/feed/","https://latamlist.com/feed/"]
+
+NAME_RE = re.compile(r"\b([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)\s([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)\b")
+
+def now(): return datetime.utcnow().replace(tzinfo=tz.tzutc()).astimezone(LOCAL_TZ)
+def within(dt): return (now()-dt) <= timedelta(days=DAYS)
+def dt_of(e):
+    for k in ("published_parsed","updated_parsed"):
+        if getattr(e,k,None): return datetime(*getattr(e,k)[:6],tzinfo=tz.tzutc()).astimezone(LOCAL_TZ)
+    return now()
+
+def gnews_q(country):
+    q='(startup OR raised OR funding OR seed OR "Series A" OR clients OR customers OR revenue OR facturación OR ingresos)'
+    return [f'https://news.google.com/rss/search?q={q}+{country}&hl=es-419&gl=LA&ceid=LA:es-419',
+            f'https://news.google.com/rss/search?q={q}+{country}&hl=en&gl=US&ceid=US:en']
+
+def country_in(text):
+    tl=text.lower()
+    for c,als in ALIASES.items():
+        for a in als:
+            if a.lower() in tl: return c
+    return ""
+
+def has(text, terms): tl=text.lower(); return any(t.lower() in tl for t in terms)
+
+def female_founder(text):
+    t=text.lower()
+    if any(p in t for p in ["founded by","co-founded by","cofundada por","fundada por","fundado por","cofounder","co-founder","fundadora","fundador","CEO","CTO"]):
+        for first,_ in NAME_RE.findall(text):
+            if first.lower() in FEMALE: return True
+    return False
+
+def score(country,text):
+    s=0
+    if country: s+=SCORE["geo"]
+    if has(text,POST): s+=SCORE["post_revenue"]
+    if female_founder(text): s+=SCORE["female"]
+    if has(text,ENT): s+=SCORE["enterprise"]
+    if has(text,BLACK): s+=SCORE["fintech_penalty"]
+    return max(0,min(10,s))
+
+def guess_company(text):
+    names=NAME_RE.findall(text)
+    if not names: return ""
+    pairs=[" ".join(n) for n in names]
+    return max(set(pairs), key=pairs.count)
+
+def read_feeds():
+    items=[]
+    for c in COUNTRIES:
+        for u in gnews_q(c):
+            d=feedparser.parse(u)
+            for e in d.entries[:MAXN]:
+                dt=dt_of(e)
+                if not within(dt): continue
+                title=e.get("title",""); summary=e.get("summary",""); link=e.get("link","")
+                blob=f"{title}\n{summary}"
+                g=country_in(blob) or country_in(u) or c
+                items.append(dict(title=title,summary=summary,url=link,published=dt,source="GoogleNews",country_guess=g))
+    for u in MEDIA:
+        d=feedparser.parse(u)
+        for e in d.entries[:MAXN]:
+            dt=dt_of(e)
+            if not within(dt): continue
+            title=e.get("title",""); summary=e.get("summary",""); link=e.get("link","")
+            g=country_in(f"{title}\n{summary}")
+            items.append(dict(title=title,summary=summary,url=link,published=dt,source=u,country_guess=g))
+    return items
+
+def transform(items):
+    rows=[]
+    for it in items:
+        title=it["title"]; summary=re.sub("<[^<]+?>","", it["summary"] or ""); url=it["url"]; country=it["country_guess"]
+        text=f"{title}. {summary}"
+        signals=[]
+        if has(text,POST): signals.append("post-revenue")
+        if female_founder(text): signals.append("female-founder")
+        if has(text,ENT): signals.append("enterprise")
+        if has(text,BLACK): signals.append("fintech-ish")
+        rows.append(dict(
+            DateFound=now().strftime("%Y-%m-%d"),
+            Company=guess_company(title) or guess_company(summary) or "",
+            URL=url, Country=country, Title=title,
+            Snippet=(summary[:217]+"…") if len(summary)>220 else summary,
+            Signals=", ".join(signals),
+            Score=score(country,text),
+            Source=it["source"], Published=it["published"].strftime("%Y-%m-%d %H:%M"),
+        ))
+    df=pd.DataFrame(rows)
+    if not df.empty: df=df.sort_values(["Score","Published"], ascending=[False,False]).reset_index(drop=True)
+    return df
+
+def main():
+    assert GOOGLE_SHEET_ID, "Set env GOOGLE_SHEET_ID"
+    items=read_feeds(); print(f"Collected {len(items)} raw items.")
+    df=transform(items)
+    if df.empty: print("No candidate leads."); return
+    gc=authorize_from_json("service_account.json")
+    sh=open_or_create_sheet(gc, GOOGLE_SHEET_ID)
+    ws=open_or_create_worksheet(sh, WNAME)
+    existing=read_existing_urls(ws)
+    new_df=df[~df["URL"].isin(existing)].copy()
+    if new_df.empty: print("No new rows."); return
+    append_dataframe(ws,new_df)
+    print(f"Appended {len(new_df)} rows.")
+    print(f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit")
+
+if __name__=="__main__": main()
+EOF
